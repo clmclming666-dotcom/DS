@@ -1,0 +1,1160 @@
+import os
+import time
+import schedule
+from openai import OpenAI
+import ccxt
+import pandas as pd
+import re
+from dotenv import load_dotenv
+import json
+import requests
+from datetime import datetime, timedelta
+
+load_dotenv()
+
+# 初始化DeepSeek客户端
+deepseek_client = OpenAI(
+    api_key=os.getenv('DEEPSEEK_API_KEY'),
+    base_url="https://api.deepseek.com"
+)
+
+# 初始化OKX交易所
+exchange = ccxt.okx({
+    'options': {
+        'defaultType': 'swap',  # OKX使用swap表示永續合約
+    },
+    'apiKey': os.getenv('OKX_API_KEY'),
+    'secret': os.getenv('OKX_SECRET'),
+    'password': os.getenv('OKX_PASSWORD'),  # OKX需要交易密碼
+})
+
+# 交易參數配置 - 多交易對支持
+TRADE_CONFIG = {
+    'symbols': [
+        {
+            'symbol': 'BTC/USDT:USDT',
+            'name': '比特幣',
+            'base_usdt_amount': 100,
+            'leverage': 10,
+        },
+        {
+            'symbol': 'ETH/USDT:USDT', 
+            'name': '以太坊',
+            'base_usdt_amount': 50,
+            'leverage': 10,
+        },
+        {
+            'symbol': 'SOL/USDT:USDT',
+            'name': 'Solana',
+            'base_usdt_amount': 30,
+            'leverage': 10,
+        }
+    ],
+    'timeframe': '15m',  # 使用15分鐘K線
+    'test_mode': False,  # 測試模式
+    'data_points': 96,  # 24小時數據（96根15分鐘K線）
+    'analysis_periods': {
+        'short_term': 20,  # 短期均線
+        'medium_term': 50,  # 中期均線
+        'long_term': 96  # 長期趨勢
+    },
+    # 智能倉位參數
+    'position_management': {
+        'enable_intelligent_position': True,  # 是否啟用智能倉位管理
+        'high_confidence_multiplier': 1.5,
+        'medium_confidence_multiplier': 1.0,
+        'low_confidence_multiplier': 0.5,
+        'max_position_ratio': 1000,  # 單次最大倉位比例
+        'trend_strength_multiplier': 1.2
+    }
+}
+
+# 全局變量存儲歷史數據
+price_history = {}
+signal_history = {}
+position = {}
+
+def setup_exchange():
+    """設置交易所參數 - 強制全倉模式"""
+    try:
+        print("🔍 獲取合約規格...")
+        markets = exchange.load_markets()
+        
+        for symbol_config in TRADE_CONFIG['symbols']:
+            symbol = symbol_config['symbol']
+            name = symbol_config['name']
+            
+            try:
+                market = markets[symbol]
+                contract_size = float(market['contractSize'])
+                symbol_config['contract_size'] = contract_size
+                symbol_config['min_amount'] = market['limits']['amount']['min']
+                
+                print(f"✅ {name}合約規格: 1張 = {contract_size} {symbol.split('/')[0]}")
+                print(f"📏 最小交易量: {symbol_config['min_amount']} 張")
+
+                # 設置單向持倉模式
+                print(f"🔄 設置{name}單向持倉模式...")
+                try:
+                    exchange.set_position_mode(False, symbol)  # False表示單向持倉
+                    print(f"✅ 已設置{name}單向持倉模式")
+                except Exception as e:
+                    print(f"⚠️ 設置{name}單向持倉模式失敗 (可能已設置): {e}")
+
+                # 設置全倉模式和槓桿
+                print(f"⚙️ 設置{name}全倉模式和槓桿...")
+                exchange.set_leverage(
+                    symbol_config['leverage'],
+                    symbol,
+                    {'mgnMode': 'cross'}  # 強制全倉模式
+                )
+                print(f"✅ 已設置{name}全倉模式，槓桿倍數: {symbol_config['leverage']}x")
+
+            except Exception as e:
+                print(f"❌ {name}合約設置失敗: {e}")
+                continue
+
+        # 驗證賬戶設置
+        print("🔍 驗證賬戶設置...")
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+        print(f"💰 當前USDT餘額: {usdt_balance:.2f}")
+
+        # 獲取當前持倉狀態
+        for symbol_config in TRADE_CONFIG['symbols']:
+            current_pos = get_current_position(symbol_config['symbol'])
+            if current_pos:
+                print(f"📦 {symbol_config['name']}當前持倉: {current_pos['side']}倉 {current_pos['size']}張")
+            else:
+                print(f"📦 {symbol_config['name']}當前無持倉")
+
+        print("🎯 程序配置完成：全倉模式 + 單向持倉")
+        return True
+
+    except Exception as e:
+        print(f"❌ 交易所設置失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def calculate_intelligent_position(signal_data, price_data, current_position, symbol_config):
+    """計算智能倉位大小 - 修復版"""
+    config = TRADE_CONFIG['position_management']
+
+    # 如果禁用智能倉位，使用固定倉位
+    if not config.get('enable_intelligent_position', True):
+        fixed_contracts = 0.1  # 固定倉位大小，可以根據需要調整
+        print(f"🔧 智能倉位已禁用，使用固定倉位: {fixed_contracts} 張")
+        return fixed_contracts
+
+    try:
+        # 獲取賬戶餘額
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+
+        # 基礎USDT投入
+        base_usdt = symbol_config['base_usdt_amount']
+        print(f"💰 可用USDT餘額: {usdt_balance:.2f}, 下單基數{base_usdt}")
+
+        # 根據信心程度調整
+        confidence_multiplier = {
+            'HIGH': config['high_confidence_multiplier'],
+            'MEDIUM': config['medium_confidence_multiplier'],
+            'LOW': config['low_confidence_multiplier']
+        }.get(signal_data['confidence'], 1.0)  # 添加默認值
+
+        # 根據趨勢強度調整
+        trend = price_data['trend_analysis'].get('overall', '震盪整理')
+        if trend in ['強勢上漲', '強勢下跌']:
+            trend_multiplier = config['trend_strength_multiplier']
+        else:
+            trend_multiplier = 1.0
+
+        # 根據RSI狀態調整（超買超賣區域減倉）
+        rsi = price_data['technical_data'].get('rsi', 50)
+        if rsi > 75 or rsi < 25:
+            rsi_multiplier = 0.7
+        else:
+            rsi_multiplier = 1.0
+
+        # 計算建議投入USDT金額
+        suggested_usdt = base_usdt * confidence_multiplier * trend_multiplier * rsi_multiplier
+
+        # 風險管理：不超過總資金的指定比例
+        max_usdt = usdt_balance * (config['max_position_ratio'] / 100)
+        final_usdt = min(suggested_usdt, max_usdt)
+
+        # 正確的合約張數計算！
+        # 公式：合約張數 = (投入USDT) / (當前價格 * 合約乘數)
+        contract_size = (final_usdt) / (price_data['price'] * symbol_config['contract_size'])
+
+        print(f"📊 倉位計算詳情:")
+        print(f"   └─ 基礎USDT: {base_usdt}")
+        print(f"   └─ 信心倍數: {confidence_multiplier}")
+        print(f"   └─ 趨勢倍數: {trend_multiplier}")
+        print(f"   └─ RSI倍數: {rsi_multiplier}")
+        print(f"   └─ 建議USDT: {suggested_usdt:.2f}")
+        print(f"   └─ 最終USDT: {final_usdt:.2f}")
+        print(f"   └─ 合約乘數: {symbol_config['contract_size']}")
+        print(f"   └─ 計算合約: {contract_size:.4f} 張")
+
+        # 精度處理：OKX BTC合約最小交易單位為0.01張
+        contract_size = round(contract_size, 2)  # 保留2位小數
+
+        # 確保最小交易量
+        min_contracts = symbol_config.get('min_amount', 0.01)
+        if contract_size < min_contracts:
+            contract_size = min_contracts
+            print(f"⚠️ 倉位小於最小值，調整為: {contract_size} 張")
+
+        print(f"🎯 最終倉位: {final_usdt:.2f} USDT → {contract_size:.2f} 張合約")
+        return contract_size
+
+    except Exception as e:
+        print(f"❌ 倉位計算失敗，使用基礎倉位: {e}")
+        # 緊急備用計算
+        base_usdt = symbol_config['base_usdt_amount']
+        contract_size = (base_usdt * symbol_config['leverage']) / (price_data['price'] * symbol_config.get('contract_size', 0.01))
+        return round(max(contract_size, symbol_config.get('min_amount', 0.01)), 2)
+
+def calculate_technical_indicators(df):
+    """計算技術指標 - 包含裸K分析"""
+    try:
+        # 移動平均線
+        df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
+        df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
+        df['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean()
+
+        # 指數移動平均線
+        df['ema_12'] = df['close'].ewm(span=12).mean()
+        df['ema_26'] = df['close'].ewm(span=26).mean()
+        df['macd'] = df['ema_12'] - df['ema_26']
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+
+        # 相對強弱指數 (RSI)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        # 布林帶
+        df['bb_middle'] = df['close'].rolling(20).mean()
+        bb_std = df['close'].rolling(20).std()
+        df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+        df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+
+        # 成交量均線
+        df['volume_ma'] = df['volume'].rolling(20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_ma']
+
+        # 支撐阻力位
+        df['resistance'] = df['high'].rolling(20).max()
+        df['support'] = df['low'].rolling(20).min()
+
+        # 🆕 裸K分析 - K線形態識別
+        df = calculate_naked_k_analysis(df)
+
+        # 填充NaN值
+        df = df.bfill().ffill()
+
+        return df
+    except Exception as e:
+        print(f"技術指標計算失敗: {e}")
+        return df
+
+def calculate_naked_k_analysis(df):
+    """裸K分析 - 識別關鍵K線形態"""
+    try:
+        # 初始化形態列
+        df['k_pattern'] = ''
+        df['k_strength'] = 0
+        
+        for i in range(2, len(df)):
+            # 當前K線數據
+            current = df.iloc[i]
+            prev = df.iloc[i-1]
+            prev2 = df.iloc[i-2]
+            
+            # 計算實體和影線
+            current_body = abs(current['close'] - current['open'])
+            current_upper_shadow = current['high'] - max(current['open'], current['close'])
+            current_lower_shadow = min(current['open'], current['close']) - current['low']
+            current_range = current['high'] - current['low']
+            
+            prev_body = abs(prev['close'] - prev['open'])
+            prev_range = prev['high'] - prev['low']
+            
+            # 錘子線/上吊線 (Hammer/Hanging Man)
+            if (current_lower_shadow >= 2 * current_body and 
+                current_upper_shadow <= current_body * 0.1 and
+                current_range > 0):
+                if current['close'] > current['open']:  # 陽線錘子
+                    df.at[df.index[i], 'k_pattern'] = '錘子線'
+                    df.at[df.index[i], 'k_strength'] = 0.7
+                else:  # 陰線上吊線
+                    df.at[df.index[i], 'k_pattern'] = '上吊線'
+                    df.at[df.index[i], 'k_strength'] = -0.7
+            
+            # 射擊之星/倒錘線 (Shooting Star/Inverted Hammer)
+            elif (current_upper_shadow >= 2 * current_body and 
+                  current_lower_shadow <= current_body * 0.1 and
+                  current_range > 0):
+                if current['close'] < current['open']:  # 陰線射擊之星
+                    df.at[df.index[i], 'k_pattern'] = '射擊之星'
+                    df.at[df.index[i], 'k_strength'] = -0.7
+                else:  # 陽線倒錘線
+                    df.at[df.index[i], 'k_pattern'] = '倒錘線'
+                    df.at[df.index[i], 'k_strength'] = 0.7
+            
+            # 吞沒形態 (Engulfing Pattern)
+            elif (current_body > prev_body * 1.2 and
+                  ((current['close'] > current['open'] and current['open'] < prev['close'] and current['close'] > prev['open']) or
+                   (current['close'] < current['open'] and current['open'] > prev['close'] and current['close'] < prev['open']))):
+                if current['close'] > current['open']:  # 多頭吞沒
+                    df.at[df.index[i], 'k_pattern'] = '多頭吞沒'
+                    df.at[df.index[i], 'k_strength'] = 0.8
+                else:  # 空頭吞沒
+                    df.at[df.index[i], 'k_pattern'] = '空頭吞沒'
+                    df.at[df.index[i], 'k_strength'] = -0.8
+            
+            # 烏雲蓋頂 (Dark Cloud Cover)
+            elif (current['close'] < current['open'] and prev['close'] > prev['open'] and
+                  current['open'] > prev['close'] and current['close'] < (prev['open'] + prev['close']) / 2):
+                df.at[df.index[i], 'k_pattern'] = '烏雲蓋頂'
+                df.at[df.index[i], 'k_strength'] = -0.6
+            
+            # 刺透形態 (Piercing Pattern)
+            elif (current['close'] > current['open'] and prev['close'] < prev['open'] and
+                  current['open'] < prev['low'] and current['close'] > (prev['open'] + prev['close']) / 2):
+                df.at[df.index[i], 'k_pattern'] = '刺透形態'
+                df.at[df.index[i], 'k_strength'] = 0.6
+            
+            # 十字星 (Doji)
+            elif current_body <= current_range * 0.1 and current_range > 0:
+                df.at[df.index[i], 'k_pattern'] = '十字星'
+                df.at[df.index[i], 'k_strength'] = 0  # 中性信號
+            
+            # 大陽線/大陰線
+            elif current_body > current_range * 0.6:
+                if current['close'] > current['open']:
+                    df.at[df.index[i], 'k_pattern'] = '大陽線'
+                    df.at[df.index[i], 'k_strength'] = 0.5
+                else:
+                    df.at[df.index[i], 'k_pattern'] = '大陰線'
+                    df.at[df.index[i], 'k_strength'] = -0.5
+        
+        return df
+    except Exception as e:
+        print(f"裸K分析計算失敗: {e}")
+        return df
+
+def get_support_resistance_levels(df, lookback=20):
+    """計算支撐阻力位"""
+    try:
+        recent_high = df['high'].tail(lookback).max()
+        recent_low = df['low'].tail(lookback).min()
+        current_price = df['close'].iloc[-1]
+
+        resistance_level = recent_high
+        support_level = recent_low
+
+        # 動態支撐阻力（基於布林帶）
+        bb_upper = df['bb_upper'].iloc[-1]
+        bb_lower = df['bb_lower'].iloc[-1]
+
+        return {
+            'static_resistance': resistance_level,
+            'static_support': support_level,
+            'dynamic_resistance': bb_upper,
+            'dynamic_support': bb_lower,
+            'price_vs_resistance': ((resistance_level - current_price) / current_price) * 100,
+            'price_vs_support': ((current_price - support_level) / support_level) * 100
+        }
+    except Exception as e:
+        print(f"支撐阻力計算失敗: {e}")
+        return {}
+
+def get_sentiment_indicators(token="BTC"):
+    """獲取情緒指標 - 簡潔版本"""
+    try:
+        API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
+        API_KEY = "7ad48a56-8730-4238-a714-eebc30834e3e"
+
+        # 獲取最近4小時數據
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=4)
+
+        request_body = {
+            "apiKey": API_KEY,
+            "endpoints": ["CO-A-02-01", "CO-A-02-02"],  # 只保留核心指標
+            "startTime": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "endTime": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timeType": "15m",
+            "token": [token]
+        }
+
+        headers = {"Content-Type": "application/json", "X-API-KEY": API_KEY}
+        response = requests.post(API_URL, json=request_body, headers=headers)
+
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("code") == 200 and data.get("data"):
+                time_periods = data["data"][0]["timePeriods"]
+
+                # 查找第一個有有效數據的時間段
+                for period in time_periods:
+                    period_data = period.get("data", [])
+
+                    sentiment = {}
+                    valid_data_found = False
+
+                    for item in period_data:
+                        endpoint = item.get("endpoint")
+                        value = item.get("value", "").strip()
+
+                        if value:  # 只處理非空值
+                            try:
+                                if endpoint in ["CO-A-02-01", "CO-A-02-02"]:
+                                    sentiment[endpoint] = float(value)
+                                    valid_data_found = True
+                            except (ValueError, TypeError):
+                                continue
+
+                    # 如果找到有效數據
+                    if valid_data_found and "CO-A-02-01" in sentiment and "CO-A-02-02" in sentiment:
+                        positive = sentiment['CO-A-02-01']
+                        negative = sentiment['CO-A-02-02']
+                        net_sentiment = positive - negative
+
+                        # 正確的時間延遲計算
+                        data_delay = int((datetime.now() - datetime.strptime(
+                            period['startTime'], '%Y-%m-%d %H:%M:%S')).total_seconds() // 60)
+
+                        print(f"✅ 使用情緒數據時間: {period['startTime']} (延遲: {data_delay}分鐘)")
+
+                        return {
+                            'positive_ratio': positive,
+                            'negative_ratio': negative,
+                            'net_sentiment': net_sentiment,
+                            'data_time': period['startTime'],
+                            'data_delay_minutes': data_delay
+                        }
+
+                print("❌ 所有時間段數據都為空")
+                return None
+
+        return None
+    except Exception as e:
+        print(f"情緒指標獲取失敗: {e}")
+        return None
+
+def get_market_trend(df):
+    """判斷市場趨勢"""
+    try:
+        current_price = df['close'].iloc[-1]
+
+        # 多時間框架趨勢分析
+        trend_short = "上漲" if current_price > df['sma_20'].iloc[-1] else "下跌"
+        trend_medium = "上漲" if current_price > df['sma_50'].iloc[-1] else "下跌"
+
+        # MACD趨勢
+        macd_trend = "bullish" if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else "bearish"
+
+        # 裸K信號
+        k_pattern = df['k_pattern'].iloc[-1]
+        k_strength = df['k_strength'].iloc[-1]
+
+        # 綜合趨勢判斷（加入裸K權重）
+        trend_score = 0
+        if trend_short == "上漲": trend_score += 0.3
+        if trend_medium == "上漲": trend_score += 0.3
+        if macd_trend == "bullish": trend_score += 0.2
+        trend_score += k_strength * 0.2  # 裸K權重與RSI相同
+
+        if trend_score >= 0.6:
+            overall_trend = "強勢上漲"
+        elif trend_score <= -0.6:
+            overall_trend = "強勢下跌"
+        else:
+            overall_trend = "震盪整理"
+
+        return {
+            'short_term': trend_short,
+            'medium_term': trend_medium,
+            'macd': macd_trend,
+            'k_pattern': k_pattern,
+            'k_strength': k_strength,
+            'overall': overall_trend,
+            'rsi_level': df['rsi'].iloc[-1],
+            'trend_score': trend_score
+        }
+    except Exception as e:
+        print(f"趨勢分析失敗: {e}")
+        return {}
+
+def get_btc_ohlcv_enhanced(symbol_config):
+    """增強版：獲取K線數據並計算技術指標"""
+    try:
+        # 獲取K線數據
+        ohlcv = exchange.fetch_ohlcv(symbol_config['symbol'], TRADE_CONFIG['timeframe'],
+                                     limit=TRADE_CONFIG['data_points'])
+
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        # 計算技術指標（包含裸K分析）
+        df = calculate_technical_indicators(df)
+
+        current_data = df.iloc[-1]
+        previous_data = df.iloc[-2]
+
+        # 獲取技術分析數據
+        trend_analysis = get_market_trend(df)
+        levels_analysis = get_support_resistance_levels(df)
+
+        return {
+            'price': current_data['close'],
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'high': current_data['high'],
+            'low': current_data['low'],
+            'volume': current_data['volume'],
+            'timeframe': TRADE_CONFIG['timeframe'],
+            'price_change': ((current_data['close'] - previous_data['close']) / previous_data['close']) * 100,
+            'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 'k_pattern']].tail(10).to_dict('records'),
+            'technical_data': {
+                'sma_5': current_data.get('sma_5', 0),
+                'sma_20': current_data.get('sma_20', 0),
+                'sma_50': current_data.get('sma_50', 0),
+                'rsi': current_data.get('rsi', 0),
+                'macd': current_data.get('macd', 0),
+                'macd_signal': current_data.get('macd_signal', 0),
+                'macd_histogram': current_data.get('macd_histogram', 0),
+                'bb_upper': current_data.get('bb_upper', 0),
+                'bb_lower': current_data.get('bb_lower', 0),
+                'bb_position': current_data.get('bb_position', 0),
+                'volume_ratio': current_data.get('volume_ratio', 0),
+                'k_pattern': current_data.get('k_pattern', ''),
+                'k_strength': current_data.get('k_strength', 0)
+            },
+            'trend_analysis': trend_analysis,
+            'levels_analysis': levels_analysis,
+            'full_data': df
+        }
+    except Exception as e:
+        print(f"獲取增強K線數據失敗: {e}")
+        return None
+
+def generate_technical_analysis_text(price_data, symbol_name):
+    """生成技術分析文本 - 優化排版"""
+    if 'technical_data' not in price_data:
+        return "技術指標數據不可用"
+
+    tech = price_data['technical_data']
+    trend = price_data.get('trend_analysis', {})
+    levels = price_data.get('levels_analysis', {})
+
+    # 檢查數據有效性
+    def safe_float(value, default=0):
+        return float(value) if value and pd.notna(value) else default
+
+    # 🆕 優化排版輸出
+    analysis_text = f"""
+    【{symbol_name}技術指標分析】
+    ┌────────────────────────────────────────────
+    │ 📈 移動平均線:
+    │   ├─ 5週期: {safe_float(tech['sma_5']):.2f} | 相對: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
+    │   ├─ 20週期: {safe_float(tech['sma_20']):.2f} | 相對: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
+    │   └─ 50週期: {safe_float(tech['sma_50']):.2f} | 相對: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
+    │
+    │ 🎯 趨勢分析:
+    │   ├─ 短期趨勢: {trend.get('short_term', 'N/A')}
+    │   ├─ 中期趨勢: {trend.get('medium_term', 'N/A')}
+    │   ├─ 整體趨勢: {trend.get('overall', 'N/A')}
+    │   ├─ MACD方向: {trend.get('macd', 'N/A')}
+    │   └─ 趨勢得分: {trend.get('trend_score', 0):.2f}
+    │
+    │ 📊 動量指標:
+    │   ├─ RSI: {safe_float(tech['rsi']):.2f} ({'超買' if safe_float(tech['rsi']) > 70 else '超賣' if safe_float(tech['rsi']) < 30 else '中性'})
+    │   ├─ MACD: {safe_float(tech['macd']):.4f}
+    │   └─ 信號線: {safe_float(tech['macd_signal']):.4f}
+    │
+    │ 🔍 裸K分析:
+    │   ├─ K線形態: {tech.get('k_pattern', '無')}
+    │   └─ 形態強度: {safe_float(tech.get('k_strength', 0)):.2f}
+    │
+    │ 🎚️ 布林帶位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
+    │
+    │ 💰 關鍵水平:
+    │   ├─ 靜態阻力: {safe_float(levels.get('static_resistance', 0)):.2f}
+    │   ├─ 靜態支撐: {safe_float(levels.get('static_support', 0)):.2f}
+    │   ├─ 動態阻力: {safe_float(levels.get('dynamic_resistance', 0)):.2f}
+    │   └─ 動態支撐: {safe_float(levels.get('dynamic_support', 0)):.2f}
+    └────────────────────────────────────────────
+    """
+    return analysis_text
+
+def get_current_position(symbol):
+    """獲取當前持倉情況 - OKX版本"""
+    try:
+        positions = exchange.fetch_positions([symbol])
+
+        for pos in positions:
+            if pos['symbol'] == symbol:
+                contracts = float(pos['contracts']) if pos['contracts'] else 0
+
+                if contracts > 0:
+                    return {
+                        'side': pos['side'],  # 'long' or 'short'
+                        'size': contracts,
+                        'entry_price': float(pos['entryPrice']) if pos['entryPrice'] else 0,
+                        'unrealized_pnl': float(pos['unrealizedPnl']) if pos['unrealizedPnl'] else 0,
+                        'leverage': float(pos['leverage']) if pos['leverage'] else TRADE_CONFIG['symbols'][0]['leverage'],
+                        'symbol': pos['symbol']
+                    }
+
+        return None
+
+    except Exception as e:
+        print(f"獲取持倉失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def safe_json_parse(json_str):
+    """安全解析JSON，處理格式不規範的情況"""
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        try:
+            # 修復常見的JSON格式問題
+            json_str = json_str.replace("'", '"')
+            json_str = re.sub(r'(\w+):', r'"\1":', json_str)
+            json_str = re.sub(r',\s*}', '}', json_str)
+            json_str = re.sub(r',\s*]', ']', json_str)
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            print(f"JSON解析失敗，原始內容: {json_str}")
+            print(f"錯誤詳情: {e}")
+            return None
+
+def create_fallback_signal(price_data):
+    """創建備用交易信號"""
+    return {
+        "signal": "HOLD",
+        "reason": "因技術分析暫時不可用，採取保守策略",
+        "stop_loss": price_data['price'] * 0.98,  # -2%
+        "take_profit": price_data['price'] * 1.02,  # +2%
+        "confidence": "LOW",
+        "is_fallback": True
+    }
+
+def analyze_with_deepseek(price_data, symbol_config):
+    """使用DeepSeek分析市場並生成交易信號（增強版）"""
+
+    symbol_name = symbol_config['name']
+    
+    # 生成技術分析文本
+    technical_analysis = generate_technical_analysis_text(price_data, symbol_name)
+
+    # 構建K線數據文本
+    kline_text = f"【最近5根{TRADE_CONFIG['timeframe']}K線數據】\n"
+    for i, kline in enumerate(price_data['kline_data'][-5:]):
+        trend = "陽線" if kline['close'] > kline['open'] else "陰線"
+        change = ((kline['close'] - kline['open']) / kline['open']) * 100
+        k_pattern = kline.get('k_pattern', '無')
+        kline_text += f"K線{i + 1}: {trend} 開:{kline['open']:.2f} 收:{kline['close']:.2f} 漲跌:{change:+.2f}% 形態:{k_pattern}\n"
+
+    # 添加上次交易信號
+    signal_text = ""
+    if symbol_config['symbol'] in signal_history and signal_history[symbol_config['symbol']]:
+        last_signal = signal_history[symbol_config['symbol']][-1]
+        signal_text = f"\n【上次交易信號】\n信號: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
+
+    # 獲取情緒數據
+    token_map = {'BTC/USDT:USDT': 'BTC', 'ETH/USDT:USDT': 'ETH', 'SOL/USDT:USDT': 'SOL'}
+    sentiment_data = get_sentiment_indicators(token_map.get(symbol_config['symbol'], 'BTC'))
+    
+    # 簡化情緒文本
+    if sentiment_data:
+        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
+        sentiment_text = f"【市場情緒】樂觀{sentiment_data['positive_ratio']:.1%} 悲觀{sentiment_data['negative_ratio']:.1%} 淨值{sign}{sentiment_data['net_sentiment']:.3f}"
+    else:
+        sentiment_text = "【市場情緒】數據暫不可用"
+
+    # 添加當前持倉信息
+    current_pos = get_current_position(symbol_config['symbol'])
+    position_text = "無持倉" if not current_pos else f"{current_pos['side']}倉, 數量: {current_pos['size']}, 盈虧: {current_pos['unrealized_pnl']:.2f}USDT"
+    pnl_text = f", 持倉盈虧: {current_pos['unrealized_pnl']:.2f} USDT" if current_pos else ""
+
+    prompt = f"""
+    你是一個專業的加密貨幣交易分析師。請基於以下{symbol_name}/USDT {TRADE_CONFIG['timeframe']}週期數據進行分析：
+
+    {kline_text}
+
+    {technical_analysis}
+
+    {signal_text}
+
+    {sentiment_text}  # 添加情緒分析
+
+    【當前行情】
+    - 當前價格: ${price_data['price']:,.2f}
+    - 時間: {price_data['timestamp']}
+    - 本K線最高: ${price_data['high']:,.2f}
+    - 本K線最低: ${price_data['low']:,.2f}
+    - 本K線成交量: {price_data['volume']:.2f} {symbol_name}
+    - 價格變化: {price_data['price_change']:+.2f}%
+    - 當前持倉: {position_text}{pnl_text}
+
+    【防頻繁交易重要原則】
+    1. **趨勢持續性優先**: 不要因單根K線或短期波動改變整體趨勢判斷
+    2. **持倉穩定性**: 除非趨勢明確強烈反轉，否則保持現有持倉方向
+    3. **反轉確認**: 需要至少2-3個技術指標同時確認趨勢反轉才改變信號
+    4. **成本意識**: 減少不必要的倉位調整，每次交易都有成本
+
+    【交易指導原則 - 必須遵守】
+    1. **技術分析主導** (權重60%)：趨勢、支撐阻力、K線形態是主要依據
+    2. **市場情緒輔助** (權重30%)：情緒數據用於驗證技術信號，不能單獨作為交易理由  
+    3. **風險管理** (權重10%)：考慮持倉、盈虧狀況和止損位置
+    4. **趨勢跟隨**: 明確趨勢出現時立即行動，不要過度等待
+    5. **裸K分析權重**: 與RSI相同，重要形態如吞沒、錘子線等應給予重視
+    6. **信號明確性**:
+    - 強勢上漲趨勢 → BUY信號
+    - 強勢下跌趨勢 → SELL信號  
+    - 僅在窄幅震盪、無明確方向時 → HOLD信號
+    7. **技術指標權重**:
+    - 趨勢(均線排列) > RSI = 裸K形態 > MACD > 布林帶
+    - 價格突破關鍵支撐/阻力位是重要信號 
+
+    【當前技術狀況分析】
+    - 整體趨勢: {price_data['trend_analysis'].get('overall', 'N/A')}
+    - 短期趨勢: {price_data['trend_analysis'].get('short_term', 'N/A')} 
+    - RSI狀態: {price_data['technical_data'].get('rsi', 0):.1f} ({'超買' if price_data['technical_data'].get('rsi', 0) > 70 else '超賣' if price_data['technical_data'].get('rsi', 0) < 30 else '中性'})
+    - MACD方向: {price_data['trend_analysis'].get('macd', 'N/A')}
+    - 裸K形態: {price_data['technical_data'].get('k_pattern', '無')} (強度: {price_data['technical_data'].get('k_strength', 0):.2f})
+
+    【智能倉位管理規則 - 必須遵守】
+
+    1. **減少過度保守**：
+       - 明確趨勢中不要因輕微超買/超賣而過度HOLD
+       - RSI在30-70區間屬於健康範圍，不應作為主要HOLD理由
+       - 布林帶位置在20%-80%屬於正常波動區間
+
+    2. **趨勢跟隨優先**：
+       - 強勢上漲趨勢 + 任何RSI值 → 積極BUY信號
+       - 強勢下跌趨勢 + 任何RSI值 → 積極SELL信號
+       - 震盪整理 + 無明確方向 → HOLD信號
+
+    3. **突破交易信號**：
+       - 價格突破關鍵阻力 + 成交量放大 → 高信心BUY
+       - 價格跌破關鍵支撐 + 成交量放大 → 高信心SELL
+
+    4. **持倉優化邏輯**：
+       - 已有持倉且趨勢延續 → 保持或BUY/SELL信號
+       - 趨勢明確反轉 → 及時反向信號
+       - 不要因為已有持倉而過度HOLD
+
+    【重要】請基於技術分析做出明確判斷，避免因過度謹慎而錯過趨勢行情！
+
+    【分析要求】
+    基於以上分析，請給出明確的交易信號
+
+    請用以下JSON格式回覆：
+    {{
+        "signal": "BUY|SELL|HOLD",
+        "reason": "簡要分析理由(包含趨勢判斷和技術依據)",
+        "stop_loss": 具體價格,
+        "take_profit": 具體價格, 
+        "confidence": "HIGH|MEDIUM|LOW"
+    }}
+    """
+
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system",
+                 "content": f"您是一位專業的交易員，專注於{TRADE_CONFIG['timeframe']}週期趨勢分析。請結合K線形態和技術指標做出判斷，並嚴格遵循JSON格式要求。"},
+                {"role": "user", "content": prompt}
+            ],
+            stream=False,
+            temperature=0.1
+        )
+
+        # 安全解析JSON
+        result = response.choices[0].message.content
+        print(f"DeepSeek原始回覆: {result}")
+
+        # 提取JSON部分
+        start_idx = result.find('{')
+        end_idx = result.rfind('}') + 1
+
+        if start_idx != -1 and end_idx != 0:
+            json_str = result[start_idx:end_idx]
+            signal_data = safe_json_parse(json_str)
+
+            if signal_data is None:
+                signal_data = create_fallback_signal(price_data)
+        else:
+            signal_data = create_fallback_signal(price_data)
+
+        # 驗證必需字段
+        required_fields = ['signal', 'reason', 'stop_loss', 'take_profit', 'confidence']
+        if not all(field in signal_data for field in required_fields):
+            signal_data = create_fallback_signal(price_data)
+
+        # 保存信號到歷史記錄
+        if symbol_config['symbol'] not in signal_history:
+            signal_history[symbol_config['symbol']] = []
+        
+        signal_data['timestamp'] = price_data['timestamp']
+        signal_history[symbol_config['symbol']].append(signal_data)
+        if len(signal_history[symbol_config['symbol']]) > 30:
+            signal_history[symbol_config['symbol']].pop(0)
+
+        # 信號統計
+        current_signals = signal_history[symbol_config['symbol']]
+        signal_count = len([s for s in current_signals if s.get('signal') == signal_data['signal']])
+        total_signals = len(current_signals)
+        print(f"信號統計: {signal_data['signal']} (最近{total_signals}次中出現{signal_count}次)")
+
+        # 信號連續性檢查
+        if len(current_signals) >= 3:
+            last_three = [s['signal'] for s in current_signals[-3:]]
+            if len(set(last_three)) == 1:
+                print(f"⚠️ 注意：連續3次{signal_data['signal']}信號")
+
+        return signal_data
+
+    except Exception as e:
+        print(f"DeepSeek分析失敗: {e}")
+        return create_fallback_signal(price_data)
+
+def execute_intelligent_trade(signal_data, price_data, symbol_config):
+    """執行智能交易 - OKX版本（支持同方向加倉減倉）"""
+    global position
+
+    symbol = symbol_config['symbol']
+    symbol_name = symbol_config['name']
+    current_position = get_current_position(symbol)
+
+    # 計算智能倉位
+    position_size = calculate_intelligent_position(signal_data, price_data, current_position, symbol_config)
+
+    print(f"🎯 {symbol_name}交易信號: {signal_data['signal']}")
+    print(f"📊 信心程度: {signal_data['confidence']}")
+    print(f"💰 智能倉位: {position_size:.2f} 張")
+    print(f"📝 理由: {signal_data['reason']}")
+    print(f"📦 當前持倉: {current_position}")
+
+    # 風險管理
+    if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
+        print("⚠️ 低信心信號，跳過執行")
+        return
+
+    if TRADE_CONFIG['test_mode']:
+        print("測試模式 - 僅模擬交易")
+        return
+
+    try:
+        # 執行交易邏輯 - 支持同方向加倉減倉
+        if signal_data['signal'] == 'BUY':
+            if current_position and current_position['side'] == 'short':
+                # 先檢查空頭持倉是否真實存在且數量正確
+                if current_position['size'] > 0:
+                    print(f"平空倉 {current_position['size']:.2f} 張並開多倉 {position_size:.2f} 張...")
+                    # 平空倉
+                    exchange.create_market_order(
+                        symbol,
+                        'buy',
+                        current_position['size'],
+                        params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                    )
+                    time.sleep(1)
+                    # 開多倉
+                    exchange.create_market_order(
+                        symbol,
+                        'buy',
+                        position_size,
+                        params={'tag': '60bb4a8d3416BCDE'}
+                    )
+                else:
+                    print("⚠️ 檢測到空頭持倉但數量為0，直接開多倉")
+                    exchange.create_market_order(
+                        symbol,
+                        'buy',
+                        position_size,
+                        params={'tag': '60bb4a8d3416BCDE'}
+                    )
+
+            elif current_position and current_position['side'] == 'long':
+                # 同方向，檢查是否需要調整倉位
+                size_diff = position_size - current_position['size']
+
+                if abs(size_diff) >= 0.01:  # 有可調整的差異
+                    if size_diff > 0:
+                        # 加倉
+                        add_size = round(size_diff, 2)
+                        print(f"多倉加倉 {add_size:.2f} 張 (當前:{current_position['size']:.2f} → 目標:{position_size:.2f})")
+                        exchange.create_market_order(
+                            symbol,
+                            'buy',
+                            add_size,
+                            params={'tag': '60bb4a8d3416BCDE'}
+                        )
+                    else:
+                        # 減倉
+                        reduce_size = round(abs(size_diff), 2)
+                        print(f"多倉減倉 {reduce_size:.2f} 張 (當前:{current_position['size']:.2f} → 目標:{position_size:.2f})")
+                        exchange.create_market_order(
+                            symbol,
+                            'sell',
+                            reduce_size,
+                            params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                        )
+                else:
+                    print(f"已有多頭持倉，倉位合適保持現狀 (當前:{current_position['size']:.2f}, 目標:{position_size:.2f})")
+            else:
+                # 無持倉時開多倉
+                print(f"開多倉 {position_size:.2f} 張...")
+                exchange.create_market_order(
+                    symbol,
+                    'buy',
+                    position_size,
+                    params={'tag': '60bb4a8d3416BCDE'}
+                )
+
+        elif signal_data['signal'] == 'SELL':
+            if current_position and current_position['side'] == 'long':
+                # 先檢查多頭持倉是否真實存在且數量正確
+                if current_position['size'] > 0:
+                    print(f"平多倉 {current_position['size']:.2f} 張並開空倉 {position_size:.2f} 張...")
+                    # 平多倉
+                    exchange.create_market_order(
+                        symbol,
+                        'sell',
+                        current_position['size'],
+                        params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                    )
+                    time.sleep(1)
+                    # 開空倉
+                    exchange.create_market_order(
+                        symbol,
+                        'sell',
+                        position_size,
+                        params={'tag': '60bb4a8d3416BCDE'}
+                    )
+                else:
+                    print("⚠️ 檢測到多頭持倉但數量為0，直接開空倉")
+                    exchange.create_market_order(
+                        symbol,
+                        'sell',
+                        position_size,
+                        params={'tag': '60bb4a8d3416BCDE'}
+                    )
+
+            elif current_position and current_position['side'] == 'short':
+                # 同方向，檢查是否需要調整倉位
+                size_diff = position_size - current_position['size']
+
+                if abs(size_diff) >= 0.01:  # 有可調整的差異
+                    if size_diff > 0:
+                        # 加倉
+                        add_size = round(size_diff, 2)
+                        print(f"空倉加倉 {add_size:.2f} 張 (當前:{current_position['size']:.2f} → 目標:{position_size:.2f})")
+                        exchange.create_market_order(
+                            symbol,
+                            'sell',
+                            add_size,
+                            params={'tag': '60bb4a8d3416BCDE'}
+                        )
+                    else:
+                        # 減倉
+                        reduce_size = round(abs(size_diff), 2)
+                        print(f"空倉減倉 {reduce_size:.2f} 張 (當前:{current_position['size']:.2f} → 目標:{position_size:.2f})")
+                        exchange.create_market_order(
+                            symbol,
+                            'buy',
+                            reduce_size,
+                            params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+                        )
+                else:
+                    print(f"已有空頭持倉，倉位合適保持現狀 (當前:{current_position['size']:.2f}, 目標:{position_size:.2f})")
+            else:
+                # 無持倉時開空倉
+                print(f"開空倉 {position_size:.2f} 張...")
+                exchange.create_market_order(
+                    symbol,
+                    'sell',
+                    position_size,
+                    params={'tag': '60bb4a8d3416BCDE'}
+                )
+
+        elif signal_data['signal'] == 'HOLD':
+            print("建議觀望，不執行交易")
+            return
+
+        print(f"✅ {symbol_name}智能交易執行成功")
+        time.sleep(2)
+        position[symbol] = get_current_position(symbol)
+        print(f"📦 更新後持倉: {position[symbol]}")
+
+    except Exception as e:
+        print(f"❌ {symbol_name}交易執行失敗: {e}")
+
+        # 如果是持倉不存在的錯誤，嘗試直接開新倉
+        if "don't have any positions" in str(e):
+            print("嘗試直接開新倉...")
+            try:
+                if signal_data['signal'] == 'BUY':
+                    exchange.create_market_order(
+                        symbol,
+                        'buy',
+                        position_size,
+                        params={'tag': '60bb4a8d3416BCDE'}
+                    )
+                elif signal_data['signal'] == 'SELL':
+                    exchange.create_market_order(
+                        symbol,
+                        'sell',
+                        position_size,
+                        params={'tag': '60bb4a8d3416BCDE'}
+                    )
+                print("直接開倉成功")
+            except Exception as e2:
+                print(f"直接開倉也失敗: {e2}")
+
+        import traceback
+        traceback.print_exc()
+
+def analyze_with_deepseek_with_retry(price_data, symbol_config, max_retries=2):
+    """帶重試的DeepSeek分析"""
+    for attempt in range(max_retries):
+        try:
+            signal_data = analyze_with_deepseek(price_data, symbol_config)
+            if signal_data and not signal_data.get('is_fallback', False):
+                return signal_data
+
+            print(f"第{attempt + 1}次嘗試失敗，進行重試...")
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"第{attempt + 1}次嘗試異常: {e}")
+            if attempt == max_retries - 1:
+                return create_fallback_signal(price_data)
+            time.sleep(1)
+
+    return create_fallback_signal(price_data)
+
+def wait_for_next_period():
+    """等待到下一個15分鐘整點"""
+    now = datetime.now()
+    current_minute = now.minute
+    current_second = now.second
+
+    # 計算下一個整點時間（00, 15, 30, 45分鐘）
+    next_period_minute = ((current_minute // 15) + 1) * 15
+    if next_period_minute == 60:
+        next_period_minute = 0
+
+    # 計算需要等待的總秒數
+    if next_period_minute > current_minute:
+        minutes_to_wait = next_period_minute - current_minute
+    else:
+        minutes_to_wait = 60 - current_minute + next_period_minute
+
+    seconds_to_wait = minutes_to_wait * 60 - current_second
+
+    # 顯示友好的等待時間
+    display_minutes = minutes_to_wait - 1 if current_second > 0 else minutes_to_wait
+    display_seconds = 60 - current_second if current_second > 0 else 0
+
+    if display_minutes > 0:
+        print(f"🕒 等待 {display_minutes} 分 {display_seconds} 秒到整點...")
+    else:
+        print(f"🕒 等待 {display_seconds} 秒到整點...")
+
+    return seconds_to_wait
+
+def trading_bot_for_symbol(symbol_config):
+    """單一交易對的交易機器人"""
+    symbol_name = symbol_config['name']
+    
+    print(f"\n{'='*60}")
+    print(f"📊 開始分析 {symbol_name}")
+    print(f"{'='*60}")
+
+    # 1. 獲取增強版K線數據
+    price_data = get_btc_ohlcv_enhanced(symbol_config)
+    if not price_data:
+        print(f"❌ 無法獲取{symbol_name}數據")
+        return
+
+    print(f"💰 {symbol_name}當前價格: ${price_data['price']:,.2f}")
+    print(f"📈 數據週期: {TRADE_CONFIG['timeframe']}")
+    print(f"📊 價格變化: {price_data['price_change']:+.2f}%")
+
+    # 2. 使用DeepSeek分析（帶重試）
+    signal_data = analyze_with_deepseek_with_retry(price_data, symbol_config)
+
+    if signal_data.get('is_fallback', False):
+        print("⚠️ 使用備用交易信號")
+
+    # 3. 執行智能交易
+    execute_intelligent_trade(signal_data, price_data, symbol_config)
+
+def trading_bot():
+    """主交易機器人函數 - 多交易對版本"""
+    # 等待到整點再執行
+    wait_seconds = wait_for_next_period()
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    print(f"\n🎯 執行時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("🌟 開始多交易對分析")
+
+    # 為每個交易對執行交易
+    for symbol_config in TRADE_CONFIG['symbols']:
+        try:
+            trading_bot_for_symbol(symbol_config)
+            time.sleep(2)  # 交易對之間稍作停頓
+        except Exception as e:
+            print(f"❌ {symbol_config['name']}分析失敗: {e}")
+            continue
+
+def main():
+    """主函數"""
+    print("🚀 BTC/ETH/SOL OKX自動交易機器人啟動成功！")
+    print("📊 融合技術指標策略 + 裸K分析 + OKX實盤接口")
+
+    if TRADE_CONFIG['test_mode']:
+        print("🔬 當前為模擬模式，不會真實下單")
+    else:
+        print("⚠️ 實盤交易模式，請謹慎操作！")
+
+    print(f"⏰ 交易週期: {TRADE_CONFIG['timeframe']}")
+    print("✅ 已啟用完整技術指標分析和持倉跟踪功能")
+
+    # 顯示支持的交易對
+    symbols_text = " | ".join([f"{config['name']}" for config in TRADE_CONFIG['symbols']])
+    print(f"🎯 支持交易對: {symbols_text}")
+
+    # 設置交易所
+    if not setup_exchange():
+        print("❌ 交易所初始化失敗，程序退出")
+        return
+
+    print("🔄 執行頻率: 每15分鐘整點執行")
+
+    # 循環執行（不使用schedule）
+    while True:
+        trading_bot()  # 函數內部會自己等待整點
+
+        # 執行完後等待一段時間再檢查（避免頻繁循環）
+        time.sleep(60)  # 每分鐘檢查一次
+
+if __name__ == "__main__":
+    main()
